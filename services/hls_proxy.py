@@ -1151,14 +1151,10 @@ class HLSProxy:
             body = await request.read()
             
             logger.info(f"🔐 Proxying License Request to: {license_url}")
-            
-            proxy = random.choice(GLOBAL_PROXIES) if GLOBAL_PROXIES else None
-            connector_kwargs = {}
-            if proxy:
-                connector_kwargs['proxy'] = proxy
-            
-            async with ClientSession() as session:
-                async with session.request(
+
+            # ✅ Use pooled session for better performance
+            session, _ = await self._get_proxy_session(license_url)
+            async with session.request(
                     request.method, 
                     license_url, 
                     headers=headers, 
@@ -1239,59 +1235,59 @@ class HLSProxy:
                 connector_kwargs['proxy'] = proxy
                 logger.info(f"Using proxy {proxy} for the key request.")
             
-            timeout = ClientTimeout(total=30)
-            async with ClientSession(timeout=timeout) as session:
-                secret_key = headers.pop('X-Secret-Key', None)
+            # ✅ Use pooled session for better performance
+            session, _ = await self._get_proxy_session(key_url)
+            secret_key = headers.pop('X-Secret-Key', None)
 
-                # Calcola X-Key-Timestamp, X-Key-Nonce, X-Fingerprint, e X-Key-Path se abbiamo la secret_key
-                if secret_key and '/key/' in key_url:
-                    # Get user agent from X-User-Agent header or fall back to User-Agent
-                    user_agent = headers.get('X-User-Agent') or headers.get('User-Agent') or headers.get('user-agent')
-                    nonce_result = self._compute_key_headers(key_url, secret_key, user_agent)
-                    if nonce_result:
-                        ts, nonce, fingerprint, key_path = nonce_result
-                        headers['X-Key-Timestamp'] = str(ts)
-                        headers['X-Key-Nonce'] = str(nonce)
-                        headers['X-Fingerprint'] = fingerprint
-                        headers['X-Key-Path'] = key_path
-                        logger.info(f"🔐 Computed key headers: ts={ts}, nonce={nonce}, fingerprint={fingerprint}, key_path={key_path}")
-                    else:
-                        logger.warning(f"⚠️ Could not compute key headers for {key_url}")
+            # Calcola X-Key-Timestamp, X-Key-Nonce, X-Fingerprint, e X-Key-Path se abbiamo la secret_key
+            if secret_key and '/key/' in key_url:
+                # Get user agent from X-User-Agent header or fall back to User-Agent
+                user_agent = headers.get('X-User-Agent') or headers.get('User-Agent') or headers.get('user-agent')
+                nonce_result = self._compute_key_headers(key_url, secret_key, user_agent)
+                if nonce_result:
+                    ts, nonce, fingerprint, key_path = nonce_result
+                    headers['X-Key-Timestamp'] = str(ts)
+                    headers['X-Key-Nonce'] = str(nonce)
+                    headers['X-Fingerprint'] = fingerprint
+                    headers['X-Key-Path'] = key_path
+                    logger.info(f"🔐 Computed key headers: ts={ts}, nonce={nonce}, fingerprint={fingerprint}, key_path={key_path}")
+                else:
+                    logger.warning(f"⚠️ Could not compute key headers for {key_url}")
 
-                # Caso 'auth' - URL che contengono 'auth' richiedono headers speciali
-                if 'auth' in key_url.lower():
-                    logger.info(f"🔐 Detected 'auth' key URL, ensuring special headers are present")
-                    if 'X-User-Agent' not in headers:
-                        headers['X-User-Agent'] = headers.get('User-Agent', headers.get('user-agent', 'Mozilla/5.0'))
-                    logger.info(f"🔐 Auth key headers: Authorization={'***' if headers.get('Authorization') else 'missing'}, X-Channel-Key={headers.get('X-Channel-Key', 'missing')}, X-User-Agent={headers.get('X-User-Agent', 'missing')}")
+            # Caso 'auth' - URL che contengono 'auth' richiedono headers speciali
+            if 'auth' in key_url.lower():
+                logger.info(f"🔐 Detected 'auth' key URL, ensuring special headers are present")
+                if 'X-User-Agent' not in headers:
+                    headers['X-User-Agent'] = headers.get('User-Agent', headers.get('user-agent', 'Mozilla/5.0'))
+                logger.info(f"🔐 Auth key headers: Authorization={'***' if headers.get('Authorization') else 'missing'}, X-Channel-Key={headers.get('X-Channel-Key', 'missing')}, X-User-Agent={headers.get('X-User-Agent', 'missing')}")
 
-                async with session.get(key_url, headers=headers, **connector_kwargs) as resp:
-                    if resp.status == 200 or resp.status == 206:
-                        key_data = await resp.read()
-                        logger.info(f"✅ AES key fetched successfully: {len(key_data)} bytes")
-                        
-                        return web.Response(
-                            body=key_data,
-                            content_type="application/octet-stream",
-                            headers={
-                                "Access-Control-Allow-Origin": "*",
-                                "Access-Control-Allow-Headers": "*",
-                                "Cache-Control": "no-cache, no-store, must-revalidate"
-                            }
-                        )
-                    else:
-                        logger.error(f"❌ Key fetch failed with status: {resp.status}")
-                        # --- LOGICA DI INVALIDAZIONE AUTOMATICA ---
-                        try:
-                            url_param = request.query.get('original_channel_url')
-                            if url_param:
-                                extractor = await self.get_extractor(url_param, {})
-                                if hasattr(extractor, 'invalidate_cache_for_url'):
-                                    await extractor.invalidate_cache_for_url(url_param)
-                        except Exception as cache_e:
-                            logger.error(f"⚠️ Error during automatic cache invalidation: {cache_e}")
-                        # --- FINE LOGICA ---
-                        return web.Response(text=f"Key fetch failed: {resp.status}", status=resp.status)
+            async with session.get(key_url, headers=headers, **connector_kwargs) as resp:
+                if resp.status == 200 or resp.status == 206:
+                    key_data = await resp.read()
+                    logger.info(f"✅ AES key fetched successfully: {len(key_data)} bytes")
+                    
+                    return web.Response(
+                        body=key_data,
+                        content_type="application/octet-stream",
+                        headers={
+                            "Access-Control-Allow-Origin": "*",
+                            "Access-Control-Allow-Headers": "*",
+                            "Cache-Control": "no-cache, no-store, must-revalidate"
+                        }
+                    )
+                else:
+                    logger.error(f"❌ Key fetch failed with status: {resp.status}")
+                    # --- LOGICA DI INVALIDAZIONE AUTOMATICA ---
+                    try:
+                        url_param = request.query.get('original_channel_url')
+                        if url_param:
+                            extractor = await self.get_extractor(url_param, {})
+                            if hasattr(extractor, 'invalidate_cache_for_url'):
+                                await extractor.invalidate_cache_for_url(url_param)
+                    except Exception as cache_e:
+                        logger.error(f"⚠️ Error during automatic cache invalidation: {cache_e}")
+                    # --- FINE LOGICA ---
+                    return web.Response(text=f"Key fetch failed: {resp.status}", status=resp.status)
                         
         except Exception as e:
             logger.error(f"❌ Error fetching AES key: {str(e)}")
@@ -1339,15 +1335,9 @@ class HLSProxy:
                 if header in request.headers:
                     headers[header] = request.headers[header]
             
-            proxy = random.choice(GLOBAL_PROXIES) if GLOBAL_PROXIES else None
-            connector_kwargs = {}
-            if proxy:
-                connector_kwargs['proxy'] = proxy
-                logger.debug(f"📡 [Proxy Segment] Utilizzo del proxy {proxy} per il segmento .ts")
-
-            timeout = ClientTimeout(total=60, connect=30)
-            async with ClientSession(timeout=timeout) as session:
-                async with session.get(segment_url, headers=headers, **connector_kwargs) as resp:
+            # ✅ Use pooled session for better performance
+            session, _ = await self._get_proxy_session(segment_url)
+            async with session.get(segment_url, headers=headers) as resp:
                     response_headers = {}
                     
                     for header in ['content-type', 'content-length', 'content-range', 
@@ -1393,12 +1383,6 @@ class HLSProxy:
             for h in ["x-forwarded-for", "x-real-ip", "forwarded", "via"]:
                 if h in headers:
                     del headers[h]
-            
-            proxy = random.choice(GLOBAL_PROXIES) if GLOBAL_PROXIES else None
-            connector_kwargs = {}
-            if proxy:
-                connector_kwargs['proxy'] = proxy
-                logger.info(f"📡 [Proxy Stream] Utilizzo del proxy {proxy} per la richiesta verso: {stream_url}")
 
             # ✅ FIX: Normalizza gli header critici (User-Agent, Referer) in Title-Case
             for key in list(headers.keys()):
@@ -1423,9 +1407,10 @@ class HLSProxy:
             # ✅ NUOVO: Determina se disabilitare SSL per questo dominio
             disable_ssl = get_ssl_setting_for_url(stream_url, TRANSPORT_ROUTES)
 
-            timeout = ClientTimeout(total=60, connect=30)
-            async with ClientSession(timeout=timeout) as session:
-                async with session.get(stream_url, headers=headers, **connector_kwargs, ssl=not disable_ssl) as resp:
+            # ✅ Use pooled session for better performance
+            session, session_proxy = await self._get_proxy_session(stream_url)
+            logger.info(f"📡 [Proxy Stream] Using session{f' via proxy {session_proxy}' if session_proxy else ' (direct)'} for: {stream_url}")
+            async with session.get(stream_url, headers=headers, ssl=not disable_ssl) as resp:
                     content_type = resp.headers.get('content-type', '')
                     
                     print(f"   Upstream Response: {resp.status} [{content_type}]")
